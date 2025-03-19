@@ -1,0 +1,56 @@
+# training environment
+CUDA_VISIBLE_DEVICES: "-1"
+output_dir: "./models"
+logging_dir: "./models"
+test_size: 0.05
+dataloader_num_workers: 0
+ddp_find_unused_parameters: False
+#resume_checkpoint_path: "./models/test_typo_correction/checkpoint-1900"
+
+# hyperparameter
+learning_rate: 2e-5
+per_device_train_batch_size: 32
+per_device_eval_batch_size: 32
+num_train_epochs: 35
+fp16: False
+weight_decay: 1.0
+warmup_ratio: 0.05
+predict_with_generate: True
+label_smoothing_factor: 0.0
+
+# logging and eval
+do_eval: True
+evaluation_strategy: "steps"
+log_level: "info"
+logging_strategy: "steps"
+logging_steps: 100
+eval_steps: 100
+
+# save strategy
+save_strategy: "steps"
+save_steps: 100
+save_total_limit: 2
+load_best_model_at_end: True
+metric_for_best_model: "f_05"
+greater_is_better: True
+
+# wandb
+report_to: "none"
+# wandb_project_name: "correction"
+# run_name: "initial_training"
+
+# model
+pretrained_model_name: "gogamza/kobart-base-v2"
+
+# data
+candidate_data_path_list:
+  - "./data/datasets/dataset_candidate.json"
+train_data_path_list:
+  - "./data/datasets/dataset_candidate.json"
+validation_data_path_list:
+  - "./data/datasets/dataset_val.json"
+src_col: "err_sentence"
+tgt_col: "cor_sentence"
+prefix: "correction:"
+group_by_length: True
+max_length: 50
