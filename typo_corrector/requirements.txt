@@ -60,3 +60,8 @@ uvicorn==0.34.0
 XlsxWriter==3.2.2
 xxhash==3.5.0
 yarl==1.18.3
+transformers
+torch
+datasets
+python-Levenshtein
+hanngul-jamo

@@ -192,8 +192,16 @@ def find_closest_candidate(err_sentence, raw_preds, candidates, top_n=3):
 
             # 후보와 점수 정보를 튜플로 저장
             candidates_with_score.append(
-                (candidate, length_diff, edit_distance, avg_similarity_score, max_similarity_score, score,
-                 avg_raw_pred_edit_distance, jamo_similarity)
+                (
+                    candidate,
+                    length_diff,
+                    edit_distance,
+                    avg_similarity_score,
+                    max_similarity_score,
+                    score,
+                    avg_raw_pred_edit_distance,
+                    jamo_similarity
+                )
             )
 
     # total_score를 기준으로 오름차순 정렬 (낮은 점수가 더 좋은 후보)

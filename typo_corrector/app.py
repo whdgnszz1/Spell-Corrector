@@ -58,8 +58,12 @@ async def correct_text(input: TextInput):
         avg_candidate_length = sum(len(c) for c in candidates) / len(candidates)
 
         # 최적의 원시 예측 선택
-        raw_prd_sentence = select_best_prediction(predictions, candidates, n_gram=2,
-                                                  avg_candidate_length=avg_candidate_length)
+        raw_prd_sentence = select_best_prediction(
+            predictions,
+            candidates,
+            n_gram=2,
+            avg_candidate_length=avg_candidate_length
+        )
 
         # 최종 예측 문장 선택
         final_prd_sentence, top_candidates = find_closest_candidate(input.text, predictions, candidates)

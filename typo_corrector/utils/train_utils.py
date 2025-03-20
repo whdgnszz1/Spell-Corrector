@@ -1,5 +1,6 @@
 import random
 
+
 # 한글 분리 및 조합 함수
 def decompose_hangul(char):
     """
@@ -14,12 +15,14 @@ def decompose_hangul(char):
     choseong = ((code - jongseong) // 28) // 21  # 초성 인덱스 계산
     return choseong, jungseong, jongseong
 
+
 def compose_hangul(choseong, jungseong, jongseong):
     """
     초성, 중성, 종성 인덱스를 조합하여 한글 문자를 생성
     - 유니코드 계산 공식: 0xAC00 + (초성 * 21 + 중성) * 28 + 종성
     """
     return chr(0xAC00 + (choseong * 21 + jungseong) * 28 + jongseong)
+
 
 # 인접 키 정의 (두벌식 자판 기준)
 choseong_adjacent = {
@@ -29,6 +32,7 @@ choseong_adjacent = {
 jungseong_adjacent = {
     0: [1, 4], 1: [0, 2], 2: [1, 3], 3: [2], 4: [0, 5], 5: [4]
 }  # 중성에 대한 인접 키 딕셔너리 (두벌식 자판 기준)
+
 
 # 증강 함수
 def substitute(char, choseong_adjacent, jungseong_adjacent):
@@ -49,6 +53,7 @@ def substitute(char, choseong_adjacent, jungseong_adjacent):
         return compose_hangul(choseong, new_jungseong, jongseong)
     return char  # 대체 불가능하면 원본 반환
 
+
 def augment_substitute(sentence, prob=0.1):
     """
     문장의 각 문자에 대해 일정 확률(prob)로 대체 증강을 수행
@@ -58,6 +63,7 @@ def augment_substitute(sentence, prob=0.1):
                  if random.random() < prob else char
                  for char in sentence]
     return ''.join(augmented)
+
 
 def augment_insert(sentence, prob=0.1):
     """
@@ -73,6 +79,7 @@ def augment_insert(sentence, prob=0.1):
             augmented.append(compose_hangul(new_choseong, new_jungseong, 0))
     return ''.join(augmented)
 
+
 def augment_delete(sentence, prob=0.1):
     """
     문장의 각 문자를 일정 확률(prob)로 삭제
@@ -84,6 +91,7 @@ def augment_delete(sentence, prob=0.1):
     if not augmented:  # 모두 삭제된 경우
         augmented = [random.choice(sentence)]  # 원본에서 랜덤 문자 선택
     return ''.join(augmented)
+
 
 def augment_transpose(sentence, prob=0.1):
     """
@@ -97,6 +105,7 @@ def augment_transpose(sentence, prob=0.1):
         if random.random() < prob:
             augmented[i], augmented[i + 1] = augmented[i + 1], augmented[i]  # 인접 문자 교환
     return ''.join(augmented)
+
 
 def augment_sentence(sentence, prob=0.1):
     """

@@ -250,7 +250,12 @@ if __name__ == '__main__':
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ========== Evaluation Start ==========')
     print(
-        f'DEVICE : {gpu_no}, MODEL PATH : {args.model_path}, FILE PATH : {args.test_file}, DATA LENGTH : {args.eval_length}, SAVE PATH : {save_path}')
+        f'DEVICE : {gpu_no}, '
+        f'MODEL PATH : {args.model_path}, '
+        f'FILE PATH : {args.test_file}, '
+        f'DATA LENGTH : {args.eval_length}, '
+        f'SAVE PATH : {save_path}'
+    )
     my_train(gpu_no, model_path=args.model_path, test_file=args.test_file, eval_length=args.eval_length,
              save_path=save_path, pb=args.pb)
     _now_time = datetime.now().__str__()
