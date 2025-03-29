@@ -1,13 +1,42 @@
-# training environment
+### 모델 및 데이터 설정 ###
+# 모델
+pretrained_model_name: "gogamza/kobart-base-v2"
+use_transformer: True
+prefix: "correction:"
+
+# 데이터 경로
+train_data_path_list:
+  - "./data/datasets/dataset_candidate.json"
+validation_data_path_list:
+  - "./data/datasets/dataset_val.json"
+candidate_data_path_list:
+  - "./data/datasets/dataset_candidate.json"
+src_col: "err_sentence"
+tgt_col: "cor_sentence"
+
+# 데이터 처리 설정
+test_size: 0.05
+max_length: 50
+group_by_length: True
+preprocessing_num_workers: 4
+dataloader_num_workers: 0
+
+### 데이터 증강 설정 ###
+augment_prob: 0.1
+use_advanced_augmentation: True
+use_back_translation: False
+src_lang: 'ko'
+tgt_lang: 'en'
+bt_sample_ratio: 0.3
+identity_sample_ratio: 0.1
+
+### 학습 환경 설정 ###
 CUDA_VISIBLE_DEVICES: "-1"
 output_dir: "./models"
 logging_dir: "./models"
-test_size: 0.05
-dataloader_num_workers: 0
 ddp_find_unused_parameters: False
-#resume_checkpoint_path: "./models/test_typo_correction/checkpoint-1900"
 
-# hyperparameter
+### 하이퍼파라미터 ###
 learning_rate: 2e-5
 per_device_train_batch_size: 32
 per_device_eval_batch_size: 32
@@ -15,18 +44,28 @@ num_train_epochs: 35
 fp16: False
 weight_decay: 1.0
 warmup_ratio: 0.05
+gradient_accumulation_steps: 1
+
+### 생성 및 평가 설정 ###
 predict_with_generate: True
 label_smoothing_factor: 0.0
+generation_num_beams: 5
+do_sample: False
+top_k: 50
+top_p: 0.95
+n_gram: 2
 
-# logging and eval
+### 로깅 및 평가 설정 ###
 do_eval: True
 evaluation_strategy: "steps"
+eval_steps: 100
 log_level: "info"
 logging_strategy: "steps"
 logging_steps: 100
-eval_steps: 100
+early_stopping_patience: 5
+early_stopping_threshold: 0.01
 
-# save strategy
+### 모델 저장 전략 ###
 save_strategy: "steps"
 save_steps: 100
 save_total_limit: 2
@@ -34,23 +73,7 @@ load_best_model_at_end: True
 metric_for_best_model: "f_05"
 greater_is_better: True
 
-# wandb
+### 외부 서비스 연동 ###
 report_to: "none"
 # wandb_project_name: "correction"
 # run_name: "initial_training"
-
-# model
-pretrained_model_name: "gogamza/kobart-base-v2"
-
-# data
-candidate_data_path_list:
-  - "./data/datasets/dataset_candidate.json"
-train_data_path_list:
-  - "./data/datasets/dataset_candidate.json"
-validation_data_path_list:
-  - "./data/datasets/dataset_val.json"
-src_col: "err_sentence"
-tgt_col: "cor_sentence"
-prefix: "correction:"
-group_by_length: True
-max_length: 50
