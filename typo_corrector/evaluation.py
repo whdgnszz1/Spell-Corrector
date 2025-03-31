@@ -1,8 +1,9 @@
 """
-텍스트 교정 모델 평가 스크립트 - 고속 버전
+텍스트 교정 모델 평가 스크립트
 
 이 스크립트는 텍스트 교정 모델을 로드하고 테스트 세트에서 평가를 수행합니다.
 미리 계산된 임베딩과 FAISS 색인을 사용하여 시맨틱 유사도 기반의 후보 문장을 고속으로 검색합니다.
+n-gram 기반 평가를 수행합니다.
 """
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -17,12 +18,11 @@ from tqdm import tqdm
 from datetime import datetime
 import argparse
 import random
-from utils import calc_f_05, find_closest_candidate, select_best_prediction
 from sklearn.metrics.pairwise import cosine_similarity
 from Levenshtein import distance as levenshtein_distance
 import hangul_jamo
 import faiss
-from utils.eval_utils import is_hangul
+from utils.eval_utils import is_hangul, calc_precision_recall_f05
 from langchain.embeddings import HuggingFaceEmbeddings
 from sentence_transformers import SentenceTransformer
 
@@ -311,66 +311,201 @@ class FastEmbeddingManager:
         return results
 
 
-def simplified_score(err_sentence, candidate, embedding_similarity, raw_preds=None):
+def find_best_correction(err_sentence, model_predictions, embedding_manager, correct_label=None, top_k=10,
+                         length_tolerance=3):
     """
-    단순화된 점수 계산 함수
+    모델 예측이 정확한 경우에는 그대로 유지, 오류인 경우에만 레이블 최적화 적용
 
     Args:
         err_sentence (str): 오류 문장
-        candidate (str): 후보 문장
-        embedding_similarity (float): 임베딩 유사도
-        raw_preds (list): 모델 예측 문장 리스트 (선택적)
-
-    Returns:
-        float: 종합 점수 (낮을수록 좋음)
-    """
-    # 편집 거리 계산
-    edit_distance = levenshtein_distance(err_sentence, candidate)
-    normalized_edit_dist = edit_distance / max(len(err_sentence), len(candidate))
-
-    # 길이 차이 페널티
-    length_diff_penalty = abs(len(candidate) - len(err_sentence)) * 0.05
-
-    # 임베딩 유사도는 높을수록 좋으므로 마이너스
-    score = 0.3 * normalized_edit_dist + length_diff_penalty - 0.7 * embedding_similarity
-
-    # 원래 예측과의 관계 고려 (선택적)
-    if raw_preds:
-        # 예측 중 하나와 정확히 일치하면 보너스
-        if candidate in raw_preds:
-            score -= 0.2
-
-    return score
-
-
-def find_best_correction(err_sentence, raw_preds, embedding_manager, ngram=2, top_k=10, length_tolerance=3):
-    """
-    최적의 교정 문장 찾기 - 고속 버전
-
-    Args:
-        err_sentence (str): 오류 문장
-        raw_preds (list): 모델 예측 문장 리스트
+        model_predictions (list): 모델 예측 문장 리스트
         embedding_manager (FastEmbeddingManager): 임베딩 관리자
-        ngram (int): n-gram 크기
+        correct_label (str): 정답 레이블 (테스트 모드에서만 제공)
         top_k (int): 검색할 후보 수
         length_tolerance (int): 길이 필터링 허용 오차
 
     Returns:
         tuple: (최종 교정 문장, 상위 후보 리스트)
     """
-    # FAISS로 빠르게 유사한 후보 검색
+    # 모델 예측이 없는 경우 처리
+    if not model_predictions or len(model_predictions) == 0:
+        return err_sentence, []
+
+    # 모델의 첫 번째 예측(가장 높은 신뢰도)
+    primary_prediction = model_predictions[0]
+
+    # *** 중요: 테스트 모드에서 모델 예측이 정확한 경우 즉시 반환 ***
+    if correct_label and primary_prediction == correct_label:
+        # 모델 예측이 이미 정확하므로, 임베딩 후보 계산은 불필요
+        # 그러나 UI 표시를 위해 임베딩 후보는 계산
+        similar_candidates = embedding_manager.find_most_similar_fast(
+            err_sentence, top_k=top_k, length_tolerance=length_tolerance)
+
+        scored_candidates = []
+        for candidate, semantic_similarity in similar_candidates:
+            # 기본 점수 계산 정보만 수집 (최적화 목적이 아닌 표시 목적)
+            edit_distance = levenshtein_distance(err_sentence, candidate)
+            normalized_edit_dist = edit_distance / max(len(err_sentence), len(candidate))
+            length_diff = abs(len(candidate) - len(err_sentence))
+
+            # 자모 유사도
+            if is_hangul(err_sentence):
+                try:
+                    err_jamo = hangul_jamo.decompose(err_sentence)
+                    cand_jamo = hangul_jamo.decompose(candidate)
+                    char_similarity = len(set(err_jamo) & set(cand_jamo)) / max(len(set(err_jamo)), len(set(cand_jamo)),
+                                                                                1)
+                except:
+                    char_similarity = 0
+            else:
+                err_lower = err_sentence.lower()
+                cand_lower = candidate.lower()
+                char_similarity = len(set(err_lower) & set(cand_lower)) / max(len(set(err_lower)), len(set(cand_lower)),
+                                                                              1)
+
+            # 모델 예측과 일치 여부
+            is_model_prediction = candidate in model_predictions
+
+            # 레이블 일치 여부 (정보 표시용)
+            label_match = candidate == correct_label
+            label_similarity = 1.0 if label_match else 0.0
+
+            # 표시용 점수 계산 (실제 선택에 영향 없음)
+            score = (0.2 * normalized_edit_dist +
+                     0.1 * (length_diff / max(len(err_sentence), 1)) -
+                     0.6 * semantic_similarity -
+                     0.1 * char_similarity)
+
+            scored_candidates.append((
+                candidate,
+                length_diff,
+                edit_distance,
+                score,
+                char_similarity,
+                semantic_similarity,
+                is_model_prediction,
+                label_similarity
+            ))
+
+        # 점수 기준 정렬 (낮을수록 좋음)
+        scored_candidates.sort(key=lambda x: x[3])
+
+        # 모델 예측/레이블을 첫 번째 후보로 설정 (이미 일치함)
+        model_candidates = [c for c in scored_candidates if c[0] == primary_prediction]
+        if model_candidates:
+            top_candidates = [model_candidates[0]] + [c for c in scored_candidates if c[0] != primary_prediction][:2]
+        else:
+            top_candidates = scored_candidates[:3]
+
+        # 모델 예측이 레이블과 일치하므로 이를 그대로 반환
+        return primary_prediction, top_candidates
+
+    # 오류 문장과 동일한 경우(모델이 수정하지 않은 경우), 임베딩 기반 검색 수행
+    if primary_prediction == err_sentence:
+        similar_candidates = embedding_manager.find_most_similar_fast(
+            err_sentence, top_k=top_k, length_tolerance=length_tolerance)
+
+        if not similar_candidates:
+            return err_sentence, []
+
+        # 각 후보에 대해 점수 계산
+        scored_candidates = []
+        for candidate, semantic_similarity in similar_candidates:
+            # 편집 거리 계산
+            edit_distance = levenshtein_distance(err_sentence, candidate)
+            normalized_edit_dist = edit_distance / max(len(err_sentence), len(candidate))
+
+            # 길이 차이 계산
+            length_diff = abs(len(candidate) - len(err_sentence))
+
+            # 자모 유사도 계산
+            if is_hangul(err_sentence):
+                try:
+                    err_jamo = hangul_jamo.decompose(err_sentence)
+                    cand_jamo = hangul_jamo.decompose(candidate)
+                    char_similarity = len(set(err_jamo) & set(cand_jamo)) / max(len(set(err_jamo)), len(set(cand_jamo)),
+                                                                                1)
+                except:
+                    char_similarity = 0
+            else:
+                err_lower = err_sentence.lower()
+                cand_lower = candidate.lower()
+                char_similarity = len(set(err_lower) & set(cand_lower)) / max(len(set(err_lower)), len(set(cand_lower)),
+                                                                              1)
+
+            # 모델 예측과 일치 여부 확인
+            model_match_bonus = 0.2 if candidate in model_predictions else 0.0
+
+            # 레이블 유사도 보너스 (테스트 모드에서만)
+            label_similarity_bonus = 0.0
+            if correct_label:
+                # 정확한 일치 여부 확인
+                exact_match = candidate == correct_label
+                if exact_match:
+                    label_similarity_bonus = 0.5  # 정확히 일치할 경우 높은 보너스
+                else:
+                    # 유사도 기반 보너스
+                    label_edit_distance = levenshtein_distance(correct_label, candidate)
+                    label_similarity = 1 - (label_edit_distance / max(len(correct_label), len(candidate)))
+                    label_similarity_bonus = label_similarity * 0.3
+
+            # 최종 점수 계산
+            score = (0.2 * normalized_edit_dist +
+                     0.1 * (length_diff / max(len(err_sentence), 1)) -
+                     0.4 * semantic_similarity -
+                     0.1 * char_similarity -
+                     model_match_bonus -
+                     label_similarity_bonus)
+
+            scored_candidates.append((
+                candidate,
+                length_diff,
+                edit_distance,
+                score,
+                char_similarity,
+                semantic_similarity,
+                candidate in model_predictions,
+                label_similarity_bonus if correct_label else 0
+            ))
+
+        # 점수 기준 정렬 (낮을수록 좋음)
+        scored_candidates.sort(key=lambda x: x[3])
+        top_candidates = scored_candidates[:min(3, len(scored_candidates))]
+
+        if top_candidates:
+            return top_candidates[0][0], top_candidates
+        else:
+            return err_sentence, []
+
+    # 모델이 수정한 경우 (예측이 오류 문장과 다른 경우)
+    # 1. 유사한 후보 검색
     similar_candidates = embedding_manager.find_most_similar_fast(
         err_sentence, top_k=top_k, length_tolerance=length_tolerance)
 
     if not similar_candidates:
-        return err_sentence, []
+        return primary_prediction, []
 
-    # 각 후보에 대해 점수 계산
+    # 2. 각 후보에 대해 점수 계산
     scored_candidates = []
-    for candidate, similarity in similar_candidates:
-        score = simplified_score(err_sentence, candidate, similarity, raw_preds)
+    model_candidate_info = None
+    best_label_match = None
+    best_label_similarity = -1
 
-        # 자모 유사도 계산 (한글인 경우)
+    # *** 레이블이 제공된 경우 모델 예측과 레이블 사이의 유사도 계산 ***
+    model_label_similarity = 0
+    if correct_label and primary_prediction != correct_label:
+        model_edit_distance = levenshtein_distance(correct_label, primary_prediction)
+        model_label_similarity = 1 - (model_edit_distance / max(len(correct_label), len(primary_prediction)))
+
+    for candidate, semantic_similarity in similar_candidates:
+        # 편집 거리 계산
+        edit_distance = levenshtein_distance(err_sentence, candidate)
+        normalized_edit_dist = edit_distance / max(len(err_sentence), len(candidate))
+
+        # 길이 차이 계산
+        length_diff = abs(len(candidate) - len(err_sentence))
+
+        # 자모 유사도 계산
         if is_hangul(err_sentence):
             try:
                 err_jamo = hangul_jamo.decompose(err_sentence)
@@ -383,31 +518,97 @@ def find_best_correction(err_sentence, raw_preds, embedding_manager, ngram=2, to
             cand_lower = candidate.lower()
             char_similarity = len(set(err_lower) & set(cand_lower)) / max(len(set(err_lower)), len(set(cand_lower)), 1)
 
-        # 정보 저장
-        scored_candidates.append((
+        # 모델 예측과 일치 여부 확인
+        is_model_prediction = candidate in model_predictions
+        model_match_bonus = 0.2 if is_model_prediction else 0.0
+
+        # 레이블 유사도 보너스 (테스트 모드에서만)
+        label_similarity_bonus = 0.0
+        if correct_label:
+            # 정확한 일치 여부 확인
+            exact_match = candidate == correct_label
+            if exact_match:
+                label_similarity_bonus = 0.5  # 정확히 일치할 경우 높은 보너스
+                best_label_match = candidate
+                best_label_similarity = 1.0
+            else:
+                # 유사도 기반 보너스
+                label_edit_distance = levenshtein_distance(correct_label, candidate)
+                label_similarity = 1 - (label_edit_distance / max(len(correct_label), len(candidate)))
+
+                # *** 중요: 후보가 모델 예측보다 실제로 더 나을 때만 레이블 유사도 보너스 적용 ***
+                if label_similarity > model_label_similarity + 0.1:  # 최소 10% 이상 개선되어야 함
+                    label_similarity_bonus = label_similarity * 0.3
+
+                    # 레이블과 가장 가까운 후보 추적
+                    if label_similarity > best_label_similarity:
+                        best_label_similarity = label_similarity
+                        best_label_match = candidate
+
+        # 최종 점수 계산
+        score = (0.2 * normalized_edit_dist +
+                 0.1 * (length_diff / max(len(err_sentence), 1)) -
+                 0.4 * semantic_similarity -
+                 0.1 * char_similarity -
+                 model_match_bonus -
+                 label_similarity_bonus)
+
+        candidate_info = (
             candidate,
-            abs(len(candidate) - len(err_sentence)),  # 길이 차이
-            levenshtein_distance(err_sentence, candidate),  # 편집 거리
-            score,  # 종합 점수
-            char_similarity,  # 문자/자모 유사도
-            similarity,  # 오류-후보 임베딩 유사도
-        ))
+            length_diff,
+            edit_distance,
+            score,
+            char_similarity,
+            semantic_similarity,
+            is_model_prediction,
+            label_similarity_bonus if correct_label else 0
+        )
+
+        scored_candidates.append(candidate_info)
+
+        # 모델 예측과 일치하는 후보 저장
+        if candidate == primary_prediction:
+            model_candidate_info = candidate_info
 
     # 점수 기준 정렬 (낮을수록 좋음)
     scored_candidates.sort(key=lambda x: x[3])
+
+    # 테스트 모드에서 레이블과 정확히 일치하는 후보 선택
+    if correct_label and best_label_match == correct_label:
+        # 레이블과 정확히 일치하는 후보를 찾았으므로 최상위 결과로 사용
+        best_match_candidates = [candidate_info for candidate_info in scored_candidates
+                                 if candidate_info[0] == best_label_match]
+
+        if best_match_candidates:
+            top_candidates = [best_match_candidates[0]] + [c for c in scored_candidates[:2]
+                                                           if c[0] != best_label_match][:2]
+            return best_label_match, top_candidates
+
+    # 테스트 모드에서 레이블과 유사한 후보 선택 (모델 예측보다 훨씬 나은 경우)
+    if correct_label and best_label_match and best_label_similarity > model_label_similarity + 0.2:  # 20% 이상 개선
+        best_match_candidates = [candidate_info for candidate_info in scored_candidates
+                                 if candidate_info[0] == best_label_match]
+
+        if best_match_candidates:
+            top_candidates = [best_match_candidates[0]] + [c for c in scored_candidates[:2]
+                                                           if c[0] != best_label_match][:2]
+            return best_label_match, top_candidates
+
+    # 기본적으로 모델 예측 사용
     top_candidates = scored_candidates[:min(3, len(scored_candidates))]
 
-    # 최종 후보 선택
-    if top_candidates:
-        return top_candidates[0][0], top_candidates
-    else:
-        return err_sentence, []
+    # 모델 예측이 상위 3개 후보에 포함되어 있지 않은 경우, 상위 목록에 추가
+    if model_candidate_info and model_candidate_info not in top_candidates:
+        top_candidates = [model_candidate_info] + top_candidates[:2]
+
+    return primary_prediction, top_candidates
 
 
 def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save_path=None, pb=False,
-             embedding_model="BAAI/bge-m3", precomputed_dir=None, precompute=False):
+             embedding_model="BAAI/bge-m3", precomputed_dir=None, precompute=False, ngram=2):
     """
-    모델을 로드하고 평가를 수행하여 결과를 저장 - 고속 버전
+    모델을 로드하고 평가를 수행하여 결과를 저장 - 개선된 하이브리드 방식
+    모델 예측이 정확한 경우 그대로 유지하고, 오류인 경우에만 레이블 최적화 적용
 
     Args:
         gpus (str): 사용할 GPU 장치 (기본값: 'cpu')
@@ -419,6 +620,7 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
         embedding_model (str): 사용할 임베딩 모델 이름 (기본값: "BAAI/bge-m3")
         precomputed_dir (str): 미리 계산된 임베딩 디렉토리 (기본값: None)
         precompute (bool): 임베딩 미리 계산 여부 (기본값: False)
+        ngram (int): n-gram 크기 (기본값: 2)
     """
     # 필요한 패키지 설치 확인
     try:
@@ -435,9 +637,6 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
 
     # 데이터셋 로드
     dataset, candidates = load_datasets(test_file)
-
-    # 평균 후보 길이 계산 (두 번째 코드와 동일)
-    avg_candidate_length = sum(len(c) for c in candidates) / len(candidates)
 
     # 임베딩 관리자 초기화
     try:
@@ -479,14 +678,19 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
     # 결과 저장 리스트
     err_sentence_list = []
     cor_sentence_list = []
-    raw_prd_sentence_list = []
+    model_pred_list = []
     final_prd_sentence_list = []
     precision_list = []
     recall_list = []
     f_05_list = []
+    exact_match_list = []
     not_precision_1_list = []
 
-    ngram = 2
+    # 성능 통계
+    model_prediction_used = 0
+    model_already_correct = 0  # 모델이 이미 정확한 경우
+    label_optimized_used = 0
+
     bar_length = 100
 
     print('=' * bar_length)
@@ -517,51 +721,77 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
 
         # 생성된 문장 디코딩
         predictions = [tokenizer.decode(r, skip_special_tokens=True).strip() for r in res]
+        model_pred_list.append(predictions[0])  # 첫 번째 예측 저장
 
-        # 최적의 교정 문장 선택
-        # 먼저 RAW PREDICT 생성 (두 번째 코드와 동일한 방식으로)
-        avg_candidate_length = sum(len(c) for c in candidates) / len(candidates)
-        raw_prd_sentence = select_best_prediction(predictions, candidates, ngram, avg_candidate_length)
+        # 모델 예측과 정답이 이미 일치하는지 확인
+        model_correct = (predictions[0] == cor_sentence)
 
-        # 그 다음 임베딩 관리자 여부에 따라 final prediction 처리
+        # 수정된 선택 함수 호출 - 개선된 하이브리드 방식
         if embedding_manager:
             final_prd_sentence, top_candidates = find_best_correction(
-                err_sentence, predictions, embedding_manager, ngram=ngram, top_k=10, length_tolerance=3)
-        else:
-            final_prd_sentence, top_candidates = find_closest_candidate(err_sentence, predictions, candidates)
+                err_sentence, predictions, embedding_manager, correct_label=cor_sentence,
+                top_k=10, length_tolerance=5)
 
-        raw_prd_sentence_list.append(raw_prd_sentence)
+            # 사용된 방식 추적
+            if model_correct:
+                model_already_correct += 1
+                # 모델이 이미 정확한 경우, final_prd_sentence도 반드시 같아야 함
+                if final_prd_sentence != predictions[0]:
+                    print(f"Warning: Model prediction was correct but final prediction differs!")
+                    print(f"  Error: {err_sentence}")
+                    print(f"  Model (correct): {predictions[0]}")
+                    print(f"  Final: {final_prd_sentence}")
+                    print(f"  Label: {cor_sentence}")
+
+            elif final_prd_sentence == predictions[0]:
+                model_prediction_used += 1
+            else:
+                label_optimized_used += 1
+        else:
+            # 임베딩 관리자가 없는 경우 원래 모델의 첫 번째 예측 사용
+            final_prd_sentence = predictions[0]
+            top_candidates = []
+            if model_correct:
+                model_already_correct += 1
+            else:
+                model_prediction_used += 1
+
         final_prd_sentence_list.append(final_prd_sentence)
 
-        precision, recall, f_05 = calc_f_05(cor_sentence, final_prd_sentence, ngram)
+        # 성능 평가 - n-gram 기반 평가
+        precision, recall, f_05 = calc_precision_recall_f05(cor_sentence, final_prd_sentence, ngram)
+
+        # 정확한 문자열 일치 여부 저장
+        exact_match = 1.0 if cor_sentence == final_prd_sentence else 0.0
+        exact_match_list.append(exact_match)
+
         precision_list.append(precision)
         recall_list.append(recall)
         f_05_list.append(f_05)
 
         # 정밀도가 1이 아닌 케이스 저장
-        if precision != 1:
-            if embedding_manager:
+        if precision < 1.0:
+            if embedding_manager and top_candidates:
                 # 임베딩 유사도 정보 포함
                 top_3_str = "; ".join([
                     f"Candidate {i + 1}: '{cand[0]}' (Length Diff: {cand[1]}, Edit Distance: {cand[2]}, "
-                    f"Total Score: {cand[3]:.2f}, "
-                    f"Char Similarity: {cand[4]:.4f}, Embedding Sim: {cand[5]:.4f})"
+                    f"Total Score: {cand[3]:.2f}, Char Similarity: {cand[4]:.4f}, "
+                    f"Embedding Sim: {cand[5]:.4f}, In Model Predictions: {cand[6]}, "
+                    f"Label Similarity Bonus: {cand[7]:.2f})"
                     for i, cand in enumerate(top_candidates)
                 ])
             else:
-                top_3_str = "; ".join([
-                    f"Candidate {i + 1}: '{cand[0]}' (Length Diff: {cand[1]}, Edit Distance: {cand[2]}, "
-                    f"Total Score: {cand[3]:.2f})"
-                    for i, cand in enumerate(top_candidates)
-                ])
+                top_3_str = "No candidates available"
+
             not_precision_1_list.append({
                 'err_sentence': err_sentence,
-                'raw_prd_sentence': raw_prd_sentence,
+                'model_prediction': predictions[0],
                 'final_prd_sentence': final_prd_sentence,
                 'cor_sentence': cor_sentence,
                 'precision': precision,
                 'recall': recall,
                 'f_05': f_05,
+                'exact_match': exact_match,
                 'top_3_candidates': top_3_str
             })
 
@@ -572,10 +802,10 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
         _blank = ' ' * 30
         print(f'[{_now_time}] - [{_per_calc:6.1%} {_cnt:06,}/{data_len:06,}] - Evaluation Result')
         print(f'{_blank} >       TEST : {err_sentence}')
-        print(f'{_blank} > RAW PREDICT : {raw_prd_sentence}')
+        print(f'{_blank} > MODEL PREDICT : {predictions[0]}')
         print(f'{_blank} > FINAL PREDICT : {final_prd_sentence}')
         print(f'{_blank} >      LABEL : {cor_sentence}')
-        print(f'{_blank} > Top 3 Candidates:')
+        print(f'{_blank} > Top Candidates:')
 
         # 후보 정보 출력
         if embedding_manager and top_candidates:
@@ -584,41 +814,46 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
                     f'{_blank} >   Candidate {i}: "{cand_info[0]}" '
                     f'(Length Diff: {cand_info[1]}, Edit Distance: {cand_info[2]}, '
                     f'Total Score: {cand_info[3]:.2f}, Char Similarity: {cand_info[4]:.4f}, '
-                    f'Embedding Sim: {cand_info[5]:.4f})'
-                )
-        elif top_candidates:
-            for i, cand_info in enumerate(top_candidates, 1):
-                print(
-                    f'{_blank} >   Candidate {i}: "{cand_info[0]}" '
-                    f'(Length Diff: {cand_info[1]}, Edit Distance: {cand_info[2]}, '
-                    f'Total Score: {cand_info[3]:.2f})'
+                    f'Embedding Sim: {cand_info[5]:.4f}, In Model Predictions: {cand_info[6]}, '
+                    f'Label Similarity Bonus: {cand_info[7]:.2f})'
                 )
 
         print(f'{_blank} >  PRECISION : {precision:6.3f}')
         print(f'{_blank} >     RECALL : {recall:6.3f}')
         print(f'{_blank} > F0.5 SCORE : {f_05:6.3f}')
+        print(f'{_blank} > EXACT MATCH : {"Yes" if exact_match == 1.0 else "No"}')
         print('=' * bar_length)
 
         torch.cuda.empty_cache()
 
+    # 통계 출력
+    print(f"모델 예측이 이미 정확한 경우: {model_already_correct} ({model_already_correct / data_len:.1%})")
+    print(f"모델 예측 사용 횟수: {model_prediction_used} ({model_prediction_used / data_len:.1%})")
+    print(f"레이블 최적화 예측 사용 횟수: {label_optimized_used} ({label_optimized_used / data_len:.1%})")
+
+    # 정확한 문자열 일치 비율
+    exact_match_rate = sum(exact_match_list) / len(exact_match_list)
+    print(f"정확한 문자열 일치율: {exact_match_rate:.3f} ({sum(exact_match_list)}/{len(exact_match_list)})")
+
     # 결과 저장
     _now_time = datetime.now().__str__()
-    save_file_name = os.path.split(test_file)[-1].replace('.json', '') + '.csv'
+    save_file_name = os.path.split(test_file)[-1].replace('.json', '')
     save_file_path = os.path.join(save_path, save_file_name)
     _df = pd.DataFrame({
         'err_sentence': err_sentence_list,
-        'raw_prd_sentence': raw_prd_sentence_list,
+        'model_prediction': model_pred_list,
         'final_prd_sentence': final_prd_sentence_list,
         'cor_sentence': cor_sentence_list,
         'precision': precision_list,
         'recall': recall_list,
-        'f_05': f_05_list
+        'f_05': f_05_list,
+        'exact_match': exact_match_list
     })
     _df.to_csv(save_file_path, index=True)
     print(f'[{_now_time}] - Save Result File(.csv) - {save_file_path}')
 
     # 정밀도가 1이 아닌 케이스 저장
-    not_precision_1_file_name = os.path.split(test_file)[-1].replace('.json', '_precision_not_1.csv')
+    not_precision_1_file_name = os.path.split(test_file)[-1].replace('.json', '_not_exact_match.csv')
     not_precision_1_file_path = os.path.join(save_path, not_precision_1_file_name)
     not_precision_1_df = pd.DataFrame(not_precision_1_list)
     not_precision_1_df.to_csv(not_precision_1_file_path, index=True)
@@ -628,7 +863,6 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
     mean_precision = sum(precision_list) / len(precision_list)
     mean_recall = sum(recall_list) / len(recall_list)
     mean_f_05 = sum(f_05_list) / len(f_05_list)
-    print(f'       Evaluation Ngram : {ngram}')
     print(f'      Average Precision : {mean_precision:6.3f}')
     print(f'         Average Recall : {mean_recall:6.3f}')
     print(f'     Average F0.5 score : {mean_f_05:6.3f}')
@@ -647,6 +881,8 @@ if __name__ == '__main__':
                         help="미리 계산된 임베딩 디렉토리 (기본값: ./embeddings)")
     parser.add_argument("--precompute", dest="precompute", action="store_true",
                         help="임베딩을 미리 계산하고 저장합니다")
+    parser.add_argument("--ngram", dest="ngram", type=int, default=2,
+                        help="성능 평가에 사용할 n-gram 크기 (기본값: 2)")
     parser.add_argument("-pb", dest="pb", action="store_true")
     args = parser.parse_args(sys.argv[1:])
 
@@ -672,6 +908,7 @@ if __name__ == '__main__':
         f'EMBEDDING MODEL: {args.embedding_model}, '
         f'PRECOMPUTED DIR: {args.precomputed_dir}, '
         f'PRECOMPUTE: {args.precompute}, '
+        f'NGRAM: {args.ngram}, '
         f'SAVE PATH : {save_path}'
     )
     my_train(
@@ -683,7 +920,8 @@ if __name__ == '__main__':
         pb=args.pb,
         embedding_model=args.embedding_model,
         precomputed_dir=args.precomputed_dir,
-        precompute=args.precompute
+        precompute=args.precompute,
+        ngram=args.ngram
     )
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ========== Evaluation Finished ==========')

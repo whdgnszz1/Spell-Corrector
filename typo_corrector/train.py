@@ -25,7 +25,7 @@ import numpy as np  # 수치 계산
 import torch  # PyTorch 딥러닝 프레임워크
 from torch.utils.tensorboard import SummaryWriter  # 텐서보드 로깅 (학습 과정 시각화)
 from utils.train_utils import augment_sentence, advanced_augment_data, back_translation_augment  # 데이터 증강 유틸리티
-from utils.eval_utils import calc_f_05, calc_bleu, calc_gleu  # 평가 메트릭 계산 유틸리티
+from utils.eval_utils import calc_precision_recall_f05, calc_bleu, calc_gleu  # 평가 메트릭 계산 유틸리티
 
 
 def seed_everything(seed):
@@ -262,7 +262,7 @@ def compute_metrics_extended(eval_pred, tokenizer, n_gram=2):
 
     for pred, label in zip(decoded_preds, decoded_labels):
         # F0.5 스코어 계산 (정밀도에 더 큰 가중치)
-        precision, recall, f_05 = calc_f_05(label, pred, n_gram)
+        precision, recall, f_05 = calc_precision_recall_f05(label, pred, n_gram)
         f_05_scores.append(f_05)
 
         # BLEU 스코어 계산 (n-gram 일치 기반 점수)

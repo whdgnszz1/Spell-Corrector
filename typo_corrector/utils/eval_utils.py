@@ -11,6 +11,7 @@ from nltk.translate.bleu_score import SmoothingFunction  # BLEU 스무딩 함수
 from nltk.translate.gleu_score import sentence_gleu  # GLEU 점수 계산용 NLTK 함수 (Google BLEU)
 from Levenshtein import distance as levenshtein_distance  # 편집 거리 계산 라이브러리
 import hangul_jamo  # 한글 자모 분해 라이브러리
+from collections import Counter
 
 
 def is_hangul(text):
@@ -235,55 +236,6 @@ def get_ngram(text, n):
     return [text[i:i + n] for i in range(len(text) - n + 1)]
 
 
-def calc_f_05(cor_sentence, final_prd_sentence, ngram):
-    """
-    정답 문장과 예측 문장 간의 F0.5 점수를 계산합니다.
-
-    F0.5 점수는 정밀도(precision)를 재현율(recall)보다 더 중요시하는 평가 지표입니다.
-    텍스트 교정 작업에서는 불필요한 수정(오탐)보다 정확한 수정이 더 중요하므로 F0.5를 주로 사용합니다.
-
-    Args:
-        cor_sentence (str): 정답 문장 (참고 문장)
-        final_prd_sentence (str): 모델이 예측한 문장
-        ngram (int): 비교에 사용할 n-gram의 크기
-
-    Returns:
-        tuple: (precision, recall, f_05)
-            - precision (float): 정밀도 (예측이 얼마나 정확한지)
-            - recall (float): 재현율 (정답을 얼마나 잘 맞췄는지)
-            - f_05 (float): F0.5 점수
-
-    Notes:
-        - TP (True Positive): 정답과 예측이 일치하는 n-gram 수
-        - FP (False Positive): 예측에만 있는 n-gram 수 (불필요한 수정)
-        - FN (False Negative): 정답에만 있는 n-gram 수 (놓친 수정)
-    """
-    # 정답과 예측 문장의 n-gram을 집합으로 변환
-    cor_ngrams = set(get_ngram(cor_sentence, ngram))  # 정답 문장의 n-gram 집합
-    prd_ngrams = set(get_ngram(final_prd_sentence, ngram))  # 예측 문장의 n-gram 집합
-
-    # 평가 지표 계산을 위한 값
-    TP = len(cor_ngrams.intersection(prd_ngrams))  # 공통 n-gram 수 (True Positive)
-    FP = len(prd_ngrams - cor_ngrams)  # 예측에만 있는 n-gram 수 (False Positive)
-    FN = len(cor_ngrams - prd_ngrams)  # 정답에만 있는 n-gram 수 (False Negative)
-
-    # 정밀도 계산: TP / (TP + FP) - 예측 중 정확한 비율
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0  # 분모가 0이면 0 반환
-
-    # 재현율 계산: TP / (TP + FN) - 정답 중 맞춘 비율
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0  # 분모가 0이면 0 반환
-
-    # F0.5 점수 계산
-    if precision + recall == 0:
-        f_05 = 0  # 정밀도와 재현율이 모두 0이면 F0.5도 0
-    else:
-        # F0.5 점수: (1 + β²) * (precision * recall) / (β² * precision + recall)
-        # β=0.5: 정밀도를 재현율보다 2배 중요시
-        f_05 = (1 + 0.5 ** 2) * (precision * recall) / (0.5 ** 2 * precision + recall)
-
-    return precision, recall, f_05
-
-
 def calc_bleu(reference, hypothesis, n_gram=4):
     """
     BLEU 점수를 계산하는 함수
@@ -353,3 +305,49 @@ def calc_gleu(reference, hypothesis, n_gram=4):
     except Exception:
         # 예외 발생 시 0 반환
         return 0.0
+
+
+def calc_precision_recall_f05(reference, candidate, ngram=2):
+    """
+    n-gram 기반의 precision, recall, F0.5 점수를 계산하는 함수
+
+    Args:
+        reference (str): 참조 문장 (올바른 정답)
+        candidate (str): 후보 문장 (모델 예측)
+        ngram (int): n-gram 크기 (기본값: 2)
+
+    Returns:
+        tuple: (precision, recall, f0.5 점수)
+    """
+    # 문자열 정확히 일치하면 모든 점수 1
+    if reference == candidate:
+        return 1.0, 1.0, 1.0
+
+    # n-gram 생성 함수
+    def get_ngrams(text, n):
+        # 문자열 가장자리에 경계 표시 추가
+        padded = '##' + text + '##'
+        ngrams = []
+        for i in range(len(padded) - n + 1):
+            ngrams.append(padded[i:i + n])
+        return ngrams
+
+    # n-gram 집합 생성
+    ref_ngrams = Counter(get_ngrams(reference, ngram))
+    cand_ngrams = Counter(get_ngrams(candidate, ngram))
+
+    # 공통 n-gram 개수 계산
+    common_ngrams = sum((ref_ngrams & cand_ngrams).values())
+
+    # precision, recall 계산
+    precision = common_ngrams / sum(cand_ngrams.values()) if sum(cand_ngrams.values()) > 0 else 0
+    recall = common_ngrams / sum(ref_ngrams.values()) if sum(ref_ngrams.values()) > 0 else 0
+
+    # F0.5 점수 계산 (precision에 더 높은 가중치)
+    beta = 0.5
+    if precision + recall == 0:
+        f_score = 0
+    else:
+        f_score = (1 + beta ** 2) * (precision * recall) / ((beta ** 2 * precision) + recall)
+
+    return precision, recall, f_score
