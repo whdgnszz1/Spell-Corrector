@@ -1,3 +1,10 @@
+"""
+텍스트 교정 모델 평가 스크립트 - 고속 버전
+
+이 스크립트는 텍스트 교정 모델을 로드하고 테스트 세트에서 평가를 수행합니다.
+미리 계산된 임베딩과 FAISS 색인을 사용하여 시맨틱 유사도 기반의 후보 문장을 고속으로 검색합니다.
+"""
+
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 import datasets
@@ -5,11 +12,19 @@ import pandas as pd
 import os
 import sys
 import json
+import numpy as np
 from tqdm import tqdm
 from datetime import datetime
 import argparse
 import random
 from utils import calc_f_05, find_closest_candidate, select_best_prediction
+from sklearn.metrics.pairwise import cosine_similarity
+from Levenshtein import distance as levenshtein_distance
+import hangul_jamo
+import faiss
+from utils.eval_utils import is_hangul
+from langchain.embeddings import HuggingFaceEmbeddings
+from sentence_transformers import SentenceTransformer
 
 
 def load_datasets(test_file, candidate_file='./data/datasets/dataset_candidate.json'):
@@ -54,32 +69,345 @@ def load_datasets(test_file, candidate_file='./data/datasets/dataset_candidate.j
     return datasets.DatasetDict(dataset_dict), candidates
 
 
-CONSONANTS = set('ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ')  # 한글 초성 집합
-VOWELS = set('ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ')  # 한글 중성 집합
-
-
-def post_process_prediction(pred, candidates):
+class FastEmbeddingManager:
     """
-    예측 문장을 후처리하여 후보에 있는 단어 또는 길이가 2 이상인 단어만 남김
+    문장 임베딩을 관리하는 클래스 - 고속 버전
+
+    미리 계산된 임베딩과 FAISS 색인을 사용하여 빠른 유사도 검색을 지원합니다.
+    """
+
+    def __init__(self, model_name="BAAI/bge-m3", precomputed_dir=None):
+        """
+        임베딩 관리자 초기화
+
+        Args:
+            model_name (str): 사용할 HuggingFace 모델 이름 (기본값: BAAI/bge-m3)
+            precomputed_dir (str): 미리 계산된 임베딩 디렉토리 (None이면 실시간 계산)
+        """
+        self.model_name = model_name
+        self.precomputed_dir = precomputed_dir
+        self.embedding_cache = {}
+        self.candidates = None
+        self.candidate_embeddings = None
+        self.faiss_index = None
+        self.model = None
+
+        # 미리 계산된 임베딩이 있으면 로드
+        if precomputed_dir and os.path.exists(precomputed_dir):
+            self._load_precomputed_embeddings()
+
+    def _load_model(self):
+        """필요할 때만 임베딩 모델 로드"""
+        if self.model is None:
+            try:
+                print(f"Initializing HuggingFace embedding model: {self.model_name}")
+                self.model = HuggingFaceEmbeddings(model_name=self.model_name)
+                print(f"HuggingFace embedding model loaded successfully.")
+            except (ImportError, Exception) as e:
+                print(f"Warning: {e}. Falling back to sentence_transformers.")
+                print(f"Initializing SentenceTransformer model: {self.model_name}")
+                self.model = SentenceTransformer(self.model_name)
+                print(f"SentenceTransformer model loaded successfully.")
+
+    def _load_precomputed_embeddings(self):
+        """미리 계산된 임베딩 로드"""
+        try:
+            # 후보 문장과 매핑 로드
+            with open(os.path.join(self.precomputed_dir, 'candidates.json'), 'r') as f:
+                self.candidates = json.load(f)
+
+            # 임베딩 로드
+            self.candidate_embeddings = np.load(os.path.join(self.precomputed_dir, 'embeddings.npy'))
+
+            # FAISS 색인 로드 또는 생성
+            index_path = os.path.join(self.precomputed_dir, 'faiss_index.bin')
+            if os.path.exists(index_path):
+                self.faiss_index = faiss.read_index(index_path)
+            else:
+                self._build_faiss_index()
+
+            print(f"Loaded precomputed embeddings for {len(self.candidates)} candidates.")
+        except Exception as e:
+            print(f"Error loading precomputed embeddings: {e}")
+            print("Will compute embeddings on-the-fly.")
+            self.candidates = None
+            self.candidate_embeddings = None
+            self.faiss_index = None
+
+    def _build_faiss_index(self):
+        """FAISS 색인 구축"""
+        if self.candidate_embeddings is None:
+            return
+
+        print("Building FAISS index...")
+        dimension = self.candidate_embeddings.shape[1]
+        normalized_embeddings = self.candidate_embeddings.copy()
+        faiss.normalize_L2(normalized_embeddings)
+
+        # 내적(코사인 유사도 계산용) 색인 생성
+        self.faiss_index = faiss.IndexFlatIP(dimension)
+        self.faiss_index.add(normalized_embeddings)
+
+        # 색인 저장
+        if self.precomputed_dir:
+            faiss.write_index(self.faiss_index, os.path.join(self.precomputed_dir, 'faiss_index.bin'))
+
+        print("FAISS index built successfully.")
+
+    def precompute_embeddings(self, candidates, output_dir=None):
+        """
+        후보 문장들의 임베딩을 미리 계산하고 저장
+
+        Args:
+            candidates (list): 후보 문장 리스트
+            output_dir (str): 출력 디렉토리
+
+        Returns:
+            np.ndarray: 임베딩 배열
+        """
+        self._load_model()
+        print(f"Precomputing embeddings for {len(candidates)} candidates...")
+
+        # 임베딩 계산
+        if hasattr(self.model, 'embed_documents'):
+            embeddings = np.array(self.model.embed_documents(candidates))
+        else:
+            embeddings = self.model.encode(candidates, convert_to_numpy=True)
+
+        # 저장
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            np.save(os.path.join(output_dir, 'embeddings.npy'), embeddings)
+            with open(os.path.join(output_dir, 'candidates.json'), 'w') as f:
+                json.dump(candidates, f)
+
+            # FAISS 색인 구축 및 저장
+            self.candidates = candidates
+            self.candidate_embeddings = embeddings
+            self._build_faiss_index()
+
+        return embeddings
+
+    def embed_texts(self, texts, use_cache=True):
+        """
+        주어진 텍스트 리스트를 임베딩으로 변환
+
+        Args:
+            texts (list): 임베딩할 텍스트 리스트
+            use_cache (bool): 캐시 사용 여부
+
+        Returns:
+            np.ndarray: 임베딩 배열
+        """
+        self._load_model()
+
+        if texts is None or len(texts) == 0:
+            return np.array([])
+
+        if use_cache:
+            # 캐시에 없는 텍스트만 새로 임베딩
+            new_texts = [text for text in texts if text not in self.embedding_cache]
+            if new_texts:
+                if hasattr(self.model, 'embed_documents'):
+                    new_embeddings = np.array(self.model.embed_documents(new_texts))
+                else:
+                    new_embeddings = self.model.encode(new_texts, convert_to_numpy=True)
+
+                for text, embedding in zip(new_texts, new_embeddings):
+                    self.embedding_cache[text] = embedding
+
+            # 모든 텍스트에 대한 임베딩 수집
+            return np.array([self.embedding_cache[text] for text in texts])
+        else:
+            if hasattr(self.model, 'embed_documents'):
+                return np.array(self.model.embed_documents(texts))
+            else:
+                return self.model.encode(texts, convert_to_numpy=True)
+
+    def find_most_similar_fast(self, query_text, top_k=10, length_tolerance=3):
+        """
+        FAISS를 사용하여 쿼리 텍스트와 가장 유사한 후보 빠르게 찾기
+
+        Args:
+            query_text (str): 쿼리 텍스트
+            top_k (int): 반환할 상위 유사 텍스트 수
+            length_tolerance (int): 길이 필터링 허용 오차
+
+        Returns:
+            list: (후보 텍스트, 유사도 점수) 쌍의 리스트
+        """
+        if self.faiss_index is None or self.candidates is None:
+            # 미리 계산된 임베딩이 없으면 일반 방식 사용
+            # candidates가 None인지 확인
+            if not hasattr(self, 'candidates') or self.candidates is None:
+                print("Warning: No candidates available. Loading all candidates from dataset.")
+                return []
+            return self.find_most_similar(query_text, self.candidates, top_k)
+
+        # 길이 기반 필터링 (선택적)
+        if length_tolerance > 0:
+            filtered_indices = [i for i, cand in enumerate(self.candidates)
+                                if abs(len(cand) - len(query_text)) <= length_tolerance]
+
+            if not filtered_indices:  # 필터링 결과가 없으면 모든 후보 사용
+                filtered_indices = list(range(len(self.candidates)))
+
+            # 필터링된 후보만 검색하기 위한 임시 색인 생성
+            filtered_embeddings = self.candidate_embeddings[filtered_indices]
+
+            dimension = filtered_embeddings.shape[1]
+            temp_index = faiss.IndexFlatIP(dimension)
+            normalized_embeddings = filtered_embeddings.copy()
+            faiss.normalize_L2(normalized_embeddings)
+            temp_index.add(normalized_embeddings)
+
+            # 쿼리 임베딩 계산
+            query_embedding = self.embed_texts([query_text])[0].reshape(1, -1)
+            faiss.normalize_L2(query_embedding)
+
+            # 유사도 검색
+            similarities, indices = temp_index.search(query_embedding, min(top_k, len(filtered_indices)))
+
+            # 실제 후보 인덱스로 변환
+            results = [(self.candidates[filtered_indices[idx]], float(similarities[0][i]))
+                       for i, idx in enumerate(indices[0]) if idx < len(filtered_indices)]
+        else:
+            # 전체 색인에서 검색
+            query_embedding = self.embed_texts([query_text])[0].reshape(1, -1)
+            faiss.normalize_L2(query_embedding)
+
+            similarities, indices = self.faiss_index.search(query_embedding, top_k)
+            results = [(self.candidates[idx], float(similarities[0][i]))
+                       for i, idx in enumerate(indices[0]) if idx < len(self.candidates)]
+
+        return results
+
+    def find_most_similar(self, query_text, reference_texts, top_k=5):
+        """
+        일반 방식: 쿼리 텍스트와 가장 유사한 참조 텍스트 찾기
+
+        Args:
+            query_text (str): 쿼리 텍스트
+            reference_texts (list): 참조 텍스트 리스트
+            top_k (int): 반환할 상위 유사 텍스트 수
+
+        Returns:
+            list: (참조 텍스트, 유사도 점수) 쌍의 리스트
+        """
+        # 쿼리 임베딩 계산
+        query_embedding = self.embed_texts([query_text])[0]
+
+        # 참조 텍스트 임베딩 계산
+        reference_embeddings = self.embed_texts(reference_texts)
+
+        # 코사인 유사도 계산
+        similarities = cosine_similarity([query_embedding], reference_embeddings)[0]
+
+        # 유사도에 따라 인덱스 정렬
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+
+        # 상위 k개 결과 반환
+        results = [(reference_texts[idx], similarities[idx]) for idx in top_indices]
+        return results
+
+
+def simplified_score(err_sentence, candidate, embedding_similarity, raw_preds=None):
+    """
+    단순화된 점수 계산 함수
 
     Args:
-        pred (str): 예측 문장
-        candidates (list): 후보 문장 리스트
+        err_sentence (str): 오류 문장
+        candidate (str): 후보 문장
+        embedding_similarity (float): 임베딩 유사도
+        raw_preds (list): 모델 예측 문장 리스트 (선택적)
 
     Returns:
-        str: 후처리된 예측 문장
+        float: 종합 점수 (낮을수록 좋음)
     """
-    candidate_words = set()
-    for cand in candidates:
-        candidate_words.update(cand.split())
-    words = pred.split()
-    cleaned_words = [word for word in words if word in candidate_words or len(word) > 2]
-    return " ".join(cleaned_words) if cleaned_words else pred
+    # 편집 거리 계산
+    edit_distance = levenshtein_distance(err_sentence, candidate)
+    normalized_edit_dist = edit_distance / max(len(err_sentence), len(candidate))
+
+    # 길이 차이 페널티
+    length_diff_penalty = abs(len(candidate) - len(err_sentence)) * 0.05
+
+    # 임베딩 유사도는 높을수록 좋으므로 마이너스
+    score = 0.3 * normalized_edit_dist + length_diff_penalty - 0.7 * embedding_similarity
+
+    # 원래 예측과의 관계 고려 (선택적)
+    if raw_preds:
+        # 예측 중 하나와 정확히 일치하면 보너스
+        if candidate in raw_preds:
+            score -= 0.2
+
+    return score
 
 
-def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save_path=None, pb=False):
+def find_best_correction(err_sentence, raw_preds, embedding_manager, ngram=2, top_k=10, length_tolerance=3):
     """
-    모델을 로드하고 평가를 수행하여 결과를 저장
+    최적의 교정 문장 찾기 - 고속 버전
+
+    Args:
+        err_sentence (str): 오류 문장
+        raw_preds (list): 모델 예측 문장 리스트
+        embedding_manager (FastEmbeddingManager): 임베딩 관리자
+        ngram (int): n-gram 크기
+        top_k (int): 검색할 후보 수
+        length_tolerance (int): 길이 필터링 허용 오차
+
+    Returns:
+        tuple: (최종 교정 문장, 상위 후보 리스트)
+    """
+    # FAISS로 빠르게 유사한 후보 검색
+    similar_candidates = embedding_manager.find_most_similar_fast(
+        err_sentence, top_k=top_k, length_tolerance=length_tolerance)
+
+    if not similar_candidates:
+        return err_sentence, []
+
+    # 각 후보에 대해 점수 계산
+    scored_candidates = []
+    for candidate, similarity in similar_candidates:
+        score = simplified_score(err_sentence, candidate, similarity, raw_preds)
+
+        # 자모 유사도 계산 (한글인 경우)
+        if is_hangul(err_sentence):
+            try:
+                err_jamo = hangul_jamo.decompose(err_sentence)
+                cand_jamo = hangul_jamo.decompose(candidate)
+                char_similarity = len(set(err_jamo) & set(cand_jamo)) / max(len(set(err_jamo)), len(set(cand_jamo)), 1)
+            except:
+                char_similarity = 0
+        else:
+            err_lower = err_sentence.lower()
+            cand_lower = candidate.lower()
+            char_similarity = len(set(err_lower) & set(cand_lower)) / max(len(set(err_lower)), len(set(cand_lower)), 1)
+
+        # 정보 저장
+        scored_candidates.append((
+            candidate,
+            abs(len(candidate) - len(err_sentence)),  # 길이 차이
+            levenshtein_distance(err_sentence, candidate),  # 편집 거리
+            score,  # 종합 점수
+            char_similarity,  # 문자/자모 유사도
+            similarity,  # 오류-후보 임베딩 유사도
+        ))
+
+    # 점수 기준 정렬 (낮을수록 좋음)
+    scored_candidates.sort(key=lambda x: x[3])
+    top_candidates = scored_candidates[:min(3, len(scored_candidates))]
+
+    # 최종 후보 선택
+    if top_candidates:
+        return top_candidates[0][0], top_candidates
+    else:
+        return err_sentence, []
+
+
+def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save_path=None, pb=False,
+             embedding_model="BAAI/bge-m3", precomputed_dir=None, precompute=False):
+    """
+    모델을 로드하고 평가를 수행하여 결과를 저장 - 고속 버전
 
     Args:
         gpus (str): 사용할 GPU 장치 (기본값: 'cpu')
@@ -88,11 +416,55 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
         eval_length (int): 평가할 데이터 길이 (기본값: None)
         save_path (str): 결과 저장 경로
         pb (bool): 진행 바 비활성화 여부 (기본값: False)
+        embedding_model (str): 사용할 임베딩 모델 이름 (기본값: "BAAI/bge-m3")
+        precomputed_dir (str): 미리 계산된 임베딩 디렉토리 (기본값: None)
+        precompute (bool): 임베딩 미리 계산 여부 (기본값: False)
     """
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_path, num_labels=2)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # 필요한 패키지 설치 확인
+    try:
+        import pip
+        required_packages = ['faiss-cpu', 'transformers']
+        for package in required_packages:
+            try:
+                __import__(package.replace('-', '_'))
+            except ImportError:
+                print(f"Package {package} not found, installing...")
+                pip.main(['install', package])
+    except:
+        print("Warning: Could not check or install required packages.")
+
+    # 데이터셋 로드
     dataset, candidates = load_datasets(test_file)
 
+    # 평균 후보 길이 계산 (두 번째 코드와 동일)
+    avg_candidate_length = sum(len(c) for c in candidates) / len(candidates)
+
+    # 임베딩 관리자 초기화
+    try:
+        embedding_manager = FastEmbeddingManager(model_name=embedding_model, precomputed_dir=precomputed_dir)
+        print(f"Embedding manager initialized with model: {embedding_model}")
+
+        # 후보 문장 설정 (초기화되지 않은 경우 대비)
+        if not hasattr(embedding_manager, 'candidates') or embedding_manager.candidates is None:
+            embedding_manager.candidates = candidates
+
+        # 임베딩 미리 계산 (요청된 경우)
+        if precompute and precomputed_dir and not os.path.exists(os.path.join(precomputed_dir, 'embeddings.npy')):
+            print("Precomputing embeddings...")
+            output_dir = precomputed_dir
+            os.makedirs(output_dir, exist_ok=True)
+            embedding_manager.precompute_embeddings(candidates, output_dir=output_dir)
+
+    except Exception as e:
+        print(f"Error initializing embedding manager: {e}")
+        embedding_manager = None
+        print("Falling back to non-embedding methods.")
+
+    # 모델 로드
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_path, num_labels=2)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    # 평가 데이터 설정
     if eval_length and eval_length < len(dataset['test']):
         indices = random.sample(range(len(dataset['test'])), eval_length)
         dataset['test'] = dataset['test'].select(indices)
@@ -100,11 +472,11 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
     else:
         data_len = len(dataset['test'])
 
+    # 디바이스 설정
     device = torch.device(gpus)
     model.to(device)
 
-    avg_candidate_length = sum(len(c) for c in candidates) / len(candidates)
-
+    # 결과 저장 리스트
     err_sentence_list = []
     cor_sentence_list = []
     raw_prd_sentence_list = []
@@ -146,10 +518,19 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
         # 생성된 문장 디코딩
         predictions = [tokenizer.decode(r, skip_special_tokens=True).strip() for r in res]
 
+        # 최적의 교정 문장 선택
+        # 먼저 RAW PREDICT 생성 (두 번째 코드와 동일한 방식으로)
+        avg_candidate_length = sum(len(c) for c in candidates) / len(candidates)
         raw_prd_sentence = select_best_prediction(predictions, candidates, ngram, avg_candidate_length)
-        raw_prd_sentence_list.append(raw_prd_sentence)
 
-        final_prd_sentence, top_candidates = find_closest_candidate(err_sentence, predictions, candidates)
+        # 그 다음 임베딩 관리자 여부에 따라 final prediction 처리
+        if embedding_manager:
+            final_prd_sentence, top_candidates = find_best_correction(
+                err_sentence, predictions, embedding_manager, ngram=ngram, top_k=10, length_tolerance=3)
+        else:
+            final_prd_sentence, top_candidates = find_closest_candidate(err_sentence, predictions, candidates)
+
+        raw_prd_sentence_list.append(raw_prd_sentence)
         final_prd_sentence_list.append(final_prd_sentence)
 
         precision, recall, f_05 = calc_f_05(cor_sentence, final_prd_sentence, ngram)
@@ -157,11 +538,22 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
         recall_list.append(recall)
         f_05_list.append(f_05)
 
+        # 정밀도가 1이 아닌 케이스 저장
         if precision != 1:
-            top_3_str = "; ".join([
-                f"Candidate {i + 1}: '{cand[0]}' (Length Diff: {cand[1]}, Edit Distance: {cand[2]}, Avg Similarity Score: {cand[3]:.4f}, Total Score: {cand[5]:.2f}, Avg RAW PREDICT Edit Distance: {cand[6]:.2f}, Common Chars: {cand[7]})"
-                for i, cand in enumerate(top_candidates)
-            ])
+            if embedding_manager:
+                # 임베딩 유사도 정보 포함
+                top_3_str = "; ".join([
+                    f"Candidate {i + 1}: '{cand[0]}' (Length Diff: {cand[1]}, Edit Distance: {cand[2]}, "
+                    f"Total Score: {cand[3]:.2f}, "
+                    f"Char Similarity: {cand[4]:.4f}, Embedding Sim: {cand[5]:.4f})"
+                    for i, cand in enumerate(top_candidates)
+                ])
+            else:
+                top_3_str = "; ".join([
+                    f"Candidate {i + 1}: '{cand[0]}' (Length Diff: {cand[1]}, Edit Distance: {cand[2]}, "
+                    f"Total Score: {cand[3]:.2f})"
+                    for i, cand in enumerate(top_candidates)
+                ])
             not_precision_1_list.append({
                 'err_sentence': err_sentence,
                 'raw_prd_sentence': raw_prd_sentence,
@@ -173,6 +565,7 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
                 'top_3_candidates': top_3_str
             })
 
+        # 결과 출력
         _cnt = n + 1
         _per_calc = round(_cnt / data_len, 4)
         _now_time = datetime.now().__str__()
@@ -183,11 +576,24 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
         print(f'{_blank} > FINAL PREDICT : {final_prd_sentence}')
         print(f'{_blank} >      LABEL : {cor_sentence}')
         print(f'{_blank} > Top 3 Candidates:')
-        for i, (cand, length_diff, edit_dist, avg_sim_score, max_sim_score, total_score, raw_pred_edit_dist,
-                common_chars) in enumerate(top_candidates, 1):
-            print(
-                f'{_blank} >   Candidate {i}: "{cand}" (Length Diff: {length_diff}, Edit Distance: {edit_dist}, Avg Similarity Score: {avg_sim_score:.4f}, Max Similarity Score: {max_sim_score:.4f}, Total Score: {total_score:.2f}, Avg RAW PREDICT Edit Distance: {raw_pred_edit_dist:.2f}, Common Chars: {common_chars})'
-            )
+
+        # 후보 정보 출력
+        if embedding_manager and top_candidates:
+            for i, cand_info in enumerate(top_candidates, 1):
+                print(
+                    f'{_blank} >   Candidate {i}: "{cand_info[0]}" '
+                    f'(Length Diff: {cand_info[1]}, Edit Distance: {cand_info[2]}, '
+                    f'Total Score: {cand_info[3]:.2f}, Char Similarity: {cand_info[4]:.4f}, '
+                    f'Embedding Sim: {cand_info[5]:.4f})'
+                )
+        elif top_candidates:
+            for i, cand_info in enumerate(top_candidates, 1):
+                print(
+                    f'{_blank} >   Candidate {i}: "{cand_info[0]}" '
+                    f'(Length Diff: {cand_info[1]}, Edit Distance: {cand_info[2]}, '
+                    f'Total Score: {cand_info[3]:.2f})'
+                )
+
         print(f'{_blank} >  PRECISION : {precision:6.3f}')
         print(f'{_blank} >     RECALL : {recall:6.3f}')
         print(f'{_blank} > F0.5 SCORE : {f_05:6.3f}')
@@ -195,6 +601,7 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
 
         torch.cuda.empty_cache()
 
+    # 결과 저장
     _now_time = datetime.now().__str__()
     save_file_name = os.path.split(test_file)[-1].replace('.json', '') + '.csv'
     save_file_path = os.path.join(save_path, save_file_name)
@@ -210,12 +617,14 @@ def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save
     _df.to_csv(save_file_path, index=True)
     print(f'[{_now_time}] - Save Result File(.csv) - {save_file_path}')
 
+    # 정밀도가 1이 아닌 케이스 저장
     not_precision_1_file_name = os.path.split(test_file)[-1].replace('.json', '_precision_not_1.csv')
     not_precision_1_file_path = os.path.join(save_path, not_precision_1_file_name)
     not_precision_1_df = pd.DataFrame(not_precision_1_list)
     not_precision_1_df.to_csv(not_precision_1_file_path, index=True)
     print(f'[{_now_time}] - Save Precision Not 1 File(.csv) - {not_precision_1_file_path}')
 
+    # 평균 성능 출력
     mean_precision = sum(precision_list) / len(precision_list)
     mean_recall = sum(recall_list) / len(recall_list)
     mean_f_05 = sum(f_05_list) / len(f_05_list)
@@ -232,6 +641,12 @@ if __name__ == '__main__':
     parser.add_argument("--model_path", dest="model_path", type=str, action="store")
     parser.add_argument("--test_file", dest="test_file", type=str, action="store")
     parser.add_argument("--eval_length", dest="eval_length", type=int, action="store")
+    parser.add_argument("--embedding_model", dest="embedding_model", type=str,
+                        default="BAAI/bge-m3", help="HuggingFace 임베딩 모델 이름 (기본값: BAAI/bge-m3)")
+    parser.add_argument("--precomputed_dir", dest="precomputed_dir", type=str, default="./embeddings",
+                        help="미리 계산된 임베딩 디렉토리 (기본값: ./embeddings)")
+    parser.add_argument("--precompute", dest="precompute", action="store_true",
+                        help="임베딩을 미리 계산하고 저장합니다")
     parser.add_argument("-pb", dest="pb", action="store_true")
     args = parser.parse_args(sys.argv[1:])
 
@@ -254,9 +669,21 @@ if __name__ == '__main__':
         f'MODEL PATH : {args.model_path}, '
         f'FILE PATH : {args.test_file}, '
         f'DATA LENGTH : {args.eval_length}, '
+        f'EMBEDDING MODEL: {args.embedding_model}, '
+        f'PRECOMPUTED DIR: {args.precomputed_dir}, '
+        f'PRECOMPUTE: {args.precompute}, '
         f'SAVE PATH : {save_path}'
     )
-    my_train(gpu_no, model_path=args.model_path, test_file=args.test_file, eval_length=args.eval_length,
-             save_path=save_path, pb=args.pb)
+    my_train(
+        gpu_no,
+        model_path=args.model_path,
+        test_file=args.test_file,
+        eval_length=args.eval_length,
+        save_path=save_path,
+        pb=args.pb,
+        embedding_model=args.embedding_model,
+        precomputed_dir=args.precomputed_dir,
+        precompute=args.precompute
+    )
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ========== Evaluation Finished ==========')
