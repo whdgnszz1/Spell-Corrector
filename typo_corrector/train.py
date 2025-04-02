@@ -24,7 +24,8 @@ import random  # 난수 생성 (데이터 증강, 샘플링)
 import numpy as np  # 수치 계산
 import torch  # PyTorch 딥러닝 프레임워크
 from torch.utils.tensorboard import SummaryWriter  # 텐서보드 로깅 (학습 과정 시각화)
-from utils.train_utils import augment_sentence, advanced_augment_data, back_translation_augment  # 데이터 증강 유틸리티
+from utils.generators import augment_sentence  # 데이터 증강 유틸리티
+from utils.train_utils import advanced_augment_data, back_translation_augment  # 데이터 증강 유틸리티
 from utils.eval_utils import calc_precision_recall_f05, calc_bleu, calc_gleu  # 평가 메트릭 계산 유틸리티
 
 

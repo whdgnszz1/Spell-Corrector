@@ -1,6 +1,26 @@
 from Levenshtein import distance as levenshtein_distance
 import hangul_jamo
-from utils.eval_utils import is_hangul
+
+
+def is_hangul(text):
+    """
+    주어진 텍스트가 한글로만 구성되어 있는지 확인
+
+    각 문자가 한글 유니코드 범위(AC00-D7A3)에 포함되는지 검사합니다.
+
+    Args:
+        text (str): 검사할 텍스트
+
+    Returns:
+        bool: 텍스트의 모든 문자가 한글 유니코드 범위(\uAC00 ~ \uD7A3)에 속하면 True, 아니면 False
+
+    Example:
+        >>> is_hangul("안녕")
+        True
+        >>> is_hangul("Hello")
+        False
+    """
+    return all('\uAC00' <= char <= '\uD7A3' for char in text)  # 한글 유니코드 범위 검사
 
 
 def find_best_correction(err_sentence, model_predictions, embedding_manager, correct_label=None, top_k=10,

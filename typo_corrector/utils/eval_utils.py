@@ -10,7 +10,7 @@ from nltk.translate.bleu_score import sentence_bleu  # BLEU 점수 계산용 NLT
 from nltk.translate.bleu_score import SmoothingFunction  # BLEU 스무딩 함수 (짧은 문장 보정)
 from nltk.translate.gleu_score import sentence_gleu  # GLEU 점수 계산용 NLTK 함수 (Google BLEU)
 from Levenshtein import distance as levenshtein_distance  # 편집 거리 계산 라이브러리
-import hangul_jamo  # 한글 자모 분해 라이브러리
+import hgtk  # 한글 자모 분해 라이브러리
 from collections import Counter
 
 
@@ -165,8 +165,8 @@ def find_closest_candidate(err_sentence, raw_preds, candidates, top_n=3):
             # 한글과 영어에 따라 유사성 계산 방식 달리 적용
             if is_hangul(err_sentence):
                 # 한글인 경우 자모 분해 후 공통 자모 비율 계산
-                err_jamo = hangul_jamo.decompose(err_sentence)  # 오류 문장을 한글 자모로 분해
-                cand_jamo = hangul_jamo.decompose(candidate)  # 후보 문장을 한글 자모로 분해
+                err_jamo = ''.join([hgtk.letter.decompose(char) for char in err_sentence if hgtk.checker.is_hangul(char)])
+                cand_jamo = ''.join([hgtk.letter.decompose(char) for char in candidate if hgtk.checker.is_hangul(char)])
                 # 자모 유사도 = 공통 자모 수 / 최대 자모 집합 크기
                 jamo_similarity = len(set(err_jamo) & set(cand_jamo)) / max(len(set(err_jamo)), len(set(cand_jamo)), 1)
             else:
