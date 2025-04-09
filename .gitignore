@@ -6,5 +6,6 @@ datasets
 results
 models
 embeddings
+data/*
 
 __pycache__/
